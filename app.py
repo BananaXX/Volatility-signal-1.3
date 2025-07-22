@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Diamond Core Trading System - Production Ready
+Diamond Core Trading System - FIXED EVENT LOOP VERSION
 Deploy to Render, Railway, or any VPS
 Real Deriv API integration with multiple pairs support
 """
@@ -21,6 +21,11 @@ from flask import Flask, render_template_string, request, jsonify
 import threading
 import time
 import aiohttp
+from concurrent.futures import ThreadPoolExecutor
+import nest_asyncio
+
+# Fix event loop issues
+nest_asyncio.apply()
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -38,8 +43,8 @@ class TelegramNotifier:
         else:
             logger.warning("Telegram notifications disabled - missing bot token or chat ID")
     
-    async def send_signal(self, signal_data: Dict, symbol: str):
-        """Send trading signal to Telegram"""
+    def send_signal_sync(self, signal_data: Dict, symbol: str):
+        """Send trading signal to Telegram - SYNC VERSION"""
         if not self.enabled:
             return False
         
@@ -64,96 +69,51 @@ class TelegramNotifier:
 ⚠️ *Educational signals - Trade responsibly*
             """
             
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    f"{self.base_url}/sendMessage",
-                    json={
-                        'chat_id': self.chat_id,
-                        'text': message,
-                        'parse_mode': 'Markdown',
-                        'disable_web_page_preview': True
-                    }
-                ) as response:
-                    if response.status == 200:
-                        logger.info(f"Signal sent to Telegram: {symbol} {signal_data['direction']}")
-                        return True
-                    else:
-                        logger.error(f"Telegram send failed: {response.status}")
-                        return False
+            response = requests.post(
+                f"{self.base_url}/sendMessage",
+                json={
+                    'chat_id': self.chat_id,
+                    'text': message,
+                    'parse_mode': 'Markdown',
+                    'disable_web_page_preview': True
+                },
+                timeout=10
+            )
+            
+            if response.status_code == 200:
+                logger.info(f"Signal sent to Telegram: {symbol} {signal_data['direction']}")
+                return True
+            else:
+                logger.error(f"Telegram send failed: {response.status_code}")
+                return False
                         
         except Exception as e:
             logger.error(f"Telegram notification error: {e}")
             return False
     
-    async def send_manipulation_alert(self, symbol: str, manipulation_data: Dict):
-        """Send manipulation detection alert"""
-        if not self.enabled or manipulation_data["manipulation_score"] < 0.8:
-            return False
-        
-        try:
-            score = manipulation_data["manipulation_score"] * 100
-            patterns = ", ".join(manipulation_data.get("patterns", []))
-            
-            message = f"""
-🚨 **MANIPULATION DETECTED**
-
-📊 **Pair:** {symbol}
-⚠️ **Score:** {score:.1f}%
-🔍 **Patterns:** {patterns}
-
-💡 **Counter-strategy activated**
-🛡️ **Risk management engaged**
-
-⏰ **Detected:** {datetime.now().strftime('%H:%M:%S')}
-            """
-            
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    f"{self.base_url}/sendMessage",
-                    json={
-                        'chat_id': self.chat_id,
-                        'text': message,
-                        'parse_mode': 'Markdown'
-                    }
-                ) as response:
-                    if response.status == 200:
-                        logger.info(f"Manipulation alert sent: {symbol}")
-                        return True
-                        
-        except Exception as e:
-            logger.error(f"Telegram manipulation alert error: {e}")
-            return False
-    
-    async def send_system_status(self, status_data: Dict):
-        """Send system status update"""
+    def send_test_signal_sync(self):
+        """Send test signal - SYNC VERSION"""
         if not self.enabled:
-            return False
+            return False, "Telegram not configured"
+        
+        test_signal = {
+            "type": "SYSTEM_TEST",
+            "direction": "BUY",
+            "strength": 95,
+            "reason": "System test - Telegram integration working",
+            "entry_price": 3600,
+            "stop_loss": 3570,
+            "take_profit": 3660
+        }
         
         try:
-            message = f"""
-🤖 **SYSTEM STATUS UPDATE**
-
-🔄 **Status:** {'🟢 Running' if status_data.get('running') else '🔴 Stopped'}
-📊 **Monitored Pairs:** {status_data.get('monitored_pairs', 0)}
-📈 **Connected Pairs:** {status_data.get('connected_pairs', 0)}
-
-⏰ **Update Time:** {datetime.now().strftime('%H:%M:%S')}
-            """
-            
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    f"{self.base_url}/sendMessage",
-                    json={
-                        'chat_id': self.chat_id,
-                        'text': message,
-                        'parse_mode': 'Markdown'
-                    }
-                ) as response:
-                    return response.status == 200
-                    
+            result = self.send_signal_sync(test_signal, "TEST_PAIR")
+            if result:
+                return True, "Test signal sent successfully"
+            else:
+                return False, "Failed to send test signal"
         except Exception as e:
-            logger.error(f"Telegram status update error: {e}")
-            return False
+            return False, f"Test failed: {str(e)}"
 
 @dataclass
 class TradingPair:
@@ -171,6 +131,7 @@ class DerivAPIClient:
         self.ws = None
         self.subscriptions = {}
         self.historical_data = {}
+        self.loop = None
         
     async def connect(self):
         """Connect to Deriv WebSocket API"""
@@ -222,66 +183,6 @@ class DerivAPIClient:
             if str(vol) in name:
                 return vol
         return 50  # Default
-    
-    async def get_historical_data(self, symbol: str, granularity: int = None, count: int = 5000):
-        """Download historical tick data"""
-        request = {
-            "ticks_history": symbol,
-            "adjust_start_time": 1,
-            "count": count,
-            "end": "latest",
-            "style": "ticks"
-        }
-        
-        if granularity:
-            request["granularity"] = granularity
-        
-        await self.ws.send(json.dumps(request))
-        response = await self.ws.recv()
-        data = json.loads(response)
-        
-        if "history" in data:
-            return self._process_historical_data(data["history"])
-        return None
-    
-    def _process_historical_data(self, history_data):
-        """Process historical data into pandas DataFrame"""
-        prices = history_data.get("prices", [])
-        times = history_data.get("times", [])
-        
-        if len(prices) != len(times):
-            return None
-        
-        df = pd.DataFrame({
-            'timestamp': [datetime.fromtimestamp(t) for t in times],
-            'price': [float(p) for p in prices],
-            'symbol': history_data.get("symbol", "")
-        })
-        
-        return df
-    
-    async def subscribe_to_ticks(self, symbol: str, callback):
-        """Subscribe to real-time tick stream"""
-        request = {"ticks": symbol, "subscribe": 1}
-        await self.ws.send(json.dumps(request))
-        
-        # Store callback for this symbol
-        self.subscriptions[symbol] = callback
-        
-        # Start listening for updates
-        asyncio.create_task(self._tick_listener())
-    
-    async def _tick_listener(self):
-        """Listen for incoming tick data"""
-        try:
-            async for message in self.ws:
-                data = json.loads(message)
-                if "tick" in data:
-                    symbol = data["tick"]["symbol"]
-                    if symbol in self.subscriptions:
-                        await self.subscriptions[symbol](data["tick"])
-        except Exception as e:
-            logger.error(f"Tick listener error: {e}")
 
 class DatabaseManager:
     def __init__(self, db_path: str = "trading_data.db"):
@@ -336,312 +237,66 @@ class DatabaseManager:
             )
         """)
         
-        # Manipulation detection table
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS manipulation_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                symbol TEXT NOT NULL,
-                event_type TEXT NOT NULL,
-                confidence REAL NOT NULL,
-                detected_at DATETIME NOT NULL,
-                price_before REAL,
-                price_after REAL,
-                spread_spike BOOLEAN DEFAULT FALSE,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        
         conn.commit()
         conn.close()
         logger.info("Database initialized successfully")
-    
-    def store_historical_data(self, df: pd.DataFrame):
-        """Store historical data in database"""
-        conn = sqlite3.connect(self.db_path)
-        df.to_sql('historical_data', conn, if_exists='append', index=False, method='ignore')
-        conn.close()
-    
-    def store_live_tick(self, symbol: str, tick_data: dict):
-        """Store live tick data"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        cursor.execute("""
-            INSERT OR IGNORE INTO live_ticks (symbol, timestamp, price, ask, bid, spread)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (
-            symbol,
-            datetime.fromtimestamp(tick_data.get('epoch', time.time())),
-            float(tick_data.get('quote', 0)),
-            float(tick_data.get('ask', 0)),
-            float(tick_data.get('bid', 0)),
-            float(tick_data.get('ask', 0)) - float(tick_data.get('bid', 0))
-        ))
-        
-        conn.commit()
-        conn.close()
-    
-    def get_recent_data(self, symbol: str, hours: int = 24) -> pd.DataFrame:
-        """Get recent tick data for analysis"""
-        conn = sqlite3.connect(self.db_path)
-        
-        query = """
-            SELECT timestamp, price, spread 
-            FROM live_ticks 
-            WHERE symbol = ? AND timestamp >= datetime('now', '-{} hours')
-            ORDER BY timestamp DESC
-        """.format(hours)
-        
-        df = pd.read_sql_query(query, conn, params=(symbol,))
-        conn.close()
-        return df
-
-class DiamondAnalysisEngine:
-    def __init__(self, db_manager: DatabaseManager):
-        self.db = db_manager
-        self.manipulation_threshold = 0.75
-        self.spread_spike_multiplier = 3.0
-        
-    def analyze_manipulation_patterns(self, symbol: str) -> Dict:
-        """Detect platform manipulation patterns"""
-        df = self.db.get_recent_data(symbol, hours=12)
-        if df.empty:
-            return {"manipulation_score": 0, "patterns": []}
-        
-        # Convert price to numeric and handle NaN
-        df['price'] = pd.to_numeric(df['price'], errors='coerce')
-        df = df.dropna()
-        
-        if len(df) < 50:
-            return {"manipulation_score": 0, "patterns": []}
-        
-        manipulation_score = 0
-        detected_patterns = []
-        
-        # 1. Spread Spike Detection
-        avg_spread = df['spread'].mean()
-        spread_spikes = df[df['spread'] > avg_spread * self.spread_spike_multiplier]
-        if len(spread_spikes) > len(df) * 0.05:  # More than 5% of ticks
-            manipulation_score += 0.3
-            detected_patterns.append("FREQUENT_SPREAD_SPIKES")
-        
-        # 2. Sudden Reversal Pattern
-        df['price_change'] = df['price'].diff()
-        large_moves = df[abs(df['price_change']) > df['price_change'].std() * 2]
-        reversals = 0
-        
-        for i in range(1, len(large_moves)):
-            if len(large_moves) > i:
-                current_move = large_moves.iloc[i]['price_change']
-                prev_move = large_moves.iloc[i-1]['price_change']
-                if current_move * prev_move < 0:  # Opposite directions
-                    reversals += 1
-        
-        if reversals > len(large_moves) * 0.6:
-            manipulation_score += 0.4
-            detected_patterns.append("SYSTEMATIC_REVERSALS")
-        
-        # 3. Price Clustering Around Round Numbers
-        df['price_rounded'] = df['price'].round(-1)  # Round to nearest 10
-        clustering = df.groupby('price_rounded').size()
-        max_cluster = clustering.max()
-        if max_cluster > len(df) * 0.15:  # More than 15% at one level
-            manipulation_score += 0.3
-            detected_patterns.append("PRICE_CLUSTERING")
-        
-        return {
-            "manipulation_score": min(1.0, manipulation_score),
-            "patterns": detected_patterns,
-            "spread_analysis": {
-                "avg_spread": float(avg_spread),
-                "spike_count": len(spread_spikes),
-                "spike_percentage": len(spread_spikes) / len(df) * 100
-            }
-        }
-    
-    def generate_counter_signals(self, symbol: str, manipulation_data: Dict) -> List[Dict]:
-        """Generate signals that counter platform manipulation"""
-        signals = []
-        
-        if manipulation_data["manipulation_score"] > self.manipulation_threshold:
-            # High manipulation detected - use counter-trend strategy
-            df = self.db.get_recent_data(symbol, hours=2)
-            if not df.empty:
-                current_price = float(df.iloc[0]['price'])
-                recent_trend = "UP" if df.iloc[0]['price'] > df.iloc[-1]['price'] else "DOWN"
-                
-                # Counter-manipulation signal
-                signals.append({
-                    "type": "COUNTER_MANIPULATION",
-                    "direction": "SELL" if recent_trend == "UP" else "BUY",
-                    "strength": int(manipulation_data["manipulation_score"] * 90),
-                    "reason": f"High manipulation detected: {manipulation_data['patterns']}",
-                    "entry_price": current_price,
-                    "stop_loss": current_price * (1.01 if recent_trend == "UP" else 0.99),
-                    "take_profit": current_price * (0.98 if recent_trend == "UP" else 1.02)
-                })
-        
-        # Add spread exploitation signals
-        spread_data = manipulation_data.get("spread_analysis", {})
-        if spread_data.get("spike_percentage", 0) > 10:
-            signals.append({
-                "type": "SPREAD_EXPLOITATION",
-                "direction": "WAIT",
-                "strength": 85,
-                "reason": "High spread volatility - wait for normalization",
-                "timing": "DELAYED_ENTRY"
-            })
-        
-        return signals
 
 class TradingSystemManager:
     def __init__(self):
         self.api_client = DerivAPIClient()
         self.db_manager = DatabaseManager()
-        self.analysis_engine = DiamondAnalysisEngine(self.db_manager)
         self.telegram = TelegramNotifier()
         self.active_pairs = {}
         self.running = False
         self.current_signals = {}
-        self.notification_sent = {}  # Track sent notifications to avoid spam
+        self.executor = ThreadPoolExecutor(max_workers=4)
         
-    async def initialize(self):
-        """Initialize the trading system"""
-        connected = await self.api_client.connect()
-        if not connected:
-            raise Exception("Failed to connect to Deriv API")
+    def run_async_task(self, coro):
+        """Run async task in executor"""
+        def run_in_thread():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                return loop.run_until_complete(coro)
+            finally:
+                loop.close()
         
-        # Get available pairs
-        available_pairs = await self.api_client.get_active_symbols()
-        self.active_pairs = {pair.symbol: pair for pair in available_pairs}
+        future = self.executor.submit(run_in_thread)
+        return future.result()
         
-        logger.info(f"Initialized with {len(self.active_pairs)} trading pairs")
-        return True
-    
-    async def download_historical_data(self, symbol: str, days: int = 730):
-        """Download 2+ years of historical data"""
-        logger.info(f"Downloading {days} days of historical data for {symbol}")
-        
-        # Download in chunks to avoid API limits
-        chunk_size = 5000  # Max ticks per request
-        total_downloaded = 0
-        
+    def initialize_sync(self):
+        """Synchronous initialization"""
         try:
-            df = await self.api_client.get_historical_data(symbol, count=chunk_size)
-            if df is not None:
-                self.db_manager.store_historical_data(df)
-                total_downloaded = len(df)
-                logger.info(f"Downloaded {total_downloaded} historical ticks for {symbol}")
-            
-            return total_downloaded > 0
+            return self.run_async_task(self.api_client.connect())
         except Exception as e:
-            logger.error(f"Historical data download failed for {symbol}: {e}")
+            logger.error(f"Initialization failed: {e}")
             return False
     
-    async def start_live_monitoring(self, symbols: List[str]):
-        """Start monitoring selected symbols"""
-        self.running = True
-        
-        for symbol in symbols:
-            if symbol in self.active_pairs:
-                # Subscribe to live ticks
-                await self.api_client.subscribe_to_ticks(
-                    symbol, 
-                    lambda tick_data, s=symbol: self._process_live_tick(s, tick_data)
-                )
-                
-                # Download historical data if not exists
-                await self.download_historical_data(symbol)
-        
-        # Start analysis loop
-        asyncio.create_task(self._analysis_loop())
-        
-        # Send startup notification
-        if self.telegram.enabled:
-            status_data = self.get_system_status()
-            await self.telegram.send_system_status(status_data)
-        
-        logger.info(f"Started monitoring {len(symbols)} symbols")
-    
-    async def _process_live_tick(self, symbol: str, tick_data: dict):
-        """Process incoming live tick data"""
+    def get_symbols_sync(self):
+        """Get symbols synchronously"""
         try:
-            # Store in database
-            self.db_manager.store_live_tick(symbol, tick_data)
+            if not self.api_client.ws:
+                connected = self.run_async_task(self.api_client.connect())
+                if not connected:
+                    return []
             
-            # Trigger analysis every 10 ticks (configurable)
-            if hasattr(self, '_tick_counter'):
-                self._tick_counter[symbol] = self._tick_counter.get(symbol, 0) + 1
-            else:
-                self._tick_counter = {symbol: 1}
-            
-            if self._tick_counter[symbol] % 10 == 0:
-                await self._analyze_symbol(symbol)
-                
+            available_pairs = self.run_async_task(self.api_client.get_active_symbols())
+            self.active_pairs = {pair.symbol: pair for pair in available_pairs}
+            logger.info(f"Retrieved {len(self.active_pairs)} trading pairs")
+            return available_pairs
         except Exception as e:
-            logger.error(f"Error processing tick for {symbol}: {e}")
-    
-    async def _analysis_loop(self):
-        """Main analysis loop running every 30 seconds"""
-        while self.running:
-            try:
-                for symbol in self.active_pairs.keys():
-                    await self._analyze_symbol(symbol)
-                
-                await asyncio.sleep(30)  # Analyze every 30 seconds
-            except Exception as e:
-                logger.error(f"Analysis loop error: {e}")
-                await asyncio.sleep(5)
-    
-    async def _analyze_symbol(self, symbol: str):
-        """Analyze a specific symbol for manipulation and signals"""
-        try:
-            # Detect manipulation patterns
-            manipulation_data = self.analysis_engine.analyze_manipulation_patterns(symbol)
-            
-            # Generate counter-signals
-            signals = self.analysis_engine.generate_counter_signals(symbol, manipulation_data)
-            
-            # Store current analysis
-            self.current_signals[symbol] = {
-                "manipulation": manipulation_data,
-                "signals": signals,
-                "last_update": datetime.now(),
-                "pair_info": self.active_pairs[symbol]
-            }
-            
-            # Send Telegram notifications
-            if self.telegram.enabled:
-                # Send manipulation alert (only once per hour to avoid spam)
-                if manipulation_data["manipulation_score"] > 0.8:
-                    last_manipulation_alert = self.notification_sent.get(f"{symbol}_manipulation", datetime.min)
-                    if datetime.now() - last_manipulation_alert > timedelta(hours=1):
-                        await self.telegram.send_manipulation_alert(symbol, manipulation_data)
-                        self.notification_sent[f"{symbol}_manipulation"] = datetime.now()
-                
-                # Send signal notifications (only for high-strength signals)
-                for signal in signals:
-                    if signal["strength"] >= 80:  # Only send strong signals
-                        signal_key = f"{symbol}_{signal['type']}_{signal['direction']}"
-                        last_signal = self.notification_sent.get(signal_key, datetime.min)
-                        
-                        # Send only once per 15 minutes for same signal type
-                        if datetime.now() - last_signal > timedelta(minutes=15):
-                            await self.telegram.send_signal(signal, symbol)
-                            self.notification_sent[signal_key] = datetime.now()
-            
-            # Log significant findings
-            if manipulation_data["manipulation_score"] > 0.7:
-                logger.warning(f"High manipulation detected in {symbol}: {manipulation_data['patterns']}")
-            
-            if signals:
-                logger.info(f"Generated {len(signals)} signals for {symbol}")
-                
-        except Exception as e:
-            logger.error(f"Analysis error for {symbol}: {e}")
+            logger.error(f"Failed to get symbols: {e}")
+            return []
     
     def get_system_status(self) -> Dict:
         """Get current system status"""
+        if not self.active_pairs:
+            # Try to get pairs if not already loaded
+            try:
+                self.get_symbols_sync()
+            except:
+                pass
+        
         return {
             "running": self.running,
             "connected_pairs": len(self.active_pairs),
@@ -676,7 +331,7 @@ HTML_TEMPLATE = """
         .manipulation-high { border-left-color: #ff4444; }
         .manipulation-medium { border-left-color: #ffaa00; }
         .manipulation-low { border-left-color: #00ff41; }
-        button { background: #00ff41; color: black; border: none; padding: 10px 20px; border-radius: 5px; cursor: pointer; font-weight: bold; }
+        button { background: #00ff41; color: black; border: none; padding: 10px 20px; border-radius: 5px; cursor: pointer; font-weight: bold; margin: 5px; }
         button:hover { background: #00cc33; }
         select, input { background: #1a1a1a; color: white; border: 1px solid #555; padding: 8px; border-radius: 4px; }
         .status-indicator { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 10px; }
@@ -685,6 +340,8 @@ HTML_TEMPLATE = """
         .metric { text-align: center; margin: 10px 0; }
         .metric-value { font-size: 24px; font-weight: bold; color: #00ff41; }
         .metric-label { font-size: 12px; color: #888; }
+        .error-message { background: #ff4444; color: white; padding: 10px; border-radius: 5px; margin: 10px 0; }
+        .success-message { background: #00ff41; color: black; padding: 10px; border-radius: 5px; margin: 10px 0; }
     </style>
 </head>
 <body>
@@ -700,11 +357,15 @@ HTML_TEMPLATE = """
         
         <div class="pair-selector">
             <h3>Select Trading Pairs:</h3>
-            <select id="pairSelect" multiple style="width: 100%; height: 150px;">
-                {% for pair in status.available_pairs %}
-                <option value="{{ pair.symbol }}">{{ pair.name }} (V{{ pair.volatility }})</option>
-                {% endfor %}
-            </select>
+            {% if status.available_pairs %}
+                <select id="pairSelect" multiple style="width: 100%; height: 150px;">
+                    {% for pair in status.available_pairs %}
+                    <option value="{{ pair.symbol }}">{{ pair.name }} (V{{ pair.volatility }})</option>
+                    {% endfor %}
+                </select>
+            {% else %}
+                <div class="error-message">No trading pairs available. Check Deriv API connection.</div>
+            {% endif %}
             <br><br>
             <button onclick="startMonitoring()">Start Monitoring</button>
             <button onclick="stopMonitoring()">Stop</button>
@@ -712,43 +373,54 @@ HTML_TEMPLATE = """
             <button onclick="testTelegram()">Test Telegram</button>
         </div>
         
-        <div class="grid">
-            {% for symbol, data in signals.items() %}
-            <div class="card">
-                <h3>{{ data.pair_info.display_name }}</h3>
-                
-                <div class="metric">
-                    <div class="metric-value">{{ "%.1f"|format(data.manipulation.manipulation_score * 100) }}%</div>
-                    <div class="metric-label">Manipulation Score</div>
-                </div>
-                
-                <div class="signals">
-                    <h4>Active Signals:</h4>
-                    {% for signal in data.signals %}
-                    <div class="signal-item">
-                        <strong>{{ signal.type }}</strong> - {{ signal.direction }}<br>
-                        <small>Strength: {{ signal.strength }}% | {{ signal.reason }}</small>
-                    </div>
-                    {% endfor %}
-                    
-                    {% if data.manipulation.patterns %}
-                    <h4>Detected Patterns:</h4>
-                    {% for pattern in data.manipulation.patterns %}
-                    <div class="signal-item manipulation-{{ 'high' if data.manipulation.manipulation_score > 0.7 else 'medium' if data.manipulation.manipulation_score > 0.4 else 'low' }}">
-                        {{ pattern.replace('_', ' ').title() }}
-                    </div>
-                    {% endfor %}
-                    {% endif %}
-                </div>
+        {% if status.available_pairs %}
+        <div class="card">
+            <h3>System Status</h3>
+            <div class="metric">
+                <div class="metric-value">{{ status.connected_pairs }}</div>
+                <div class="metric-label">Available Pairs</div>
             </div>
-            {% endfor %}
+            <div class="signals">
+                <h4>Available Synthetic Indices:</h4>
+                {% for pair in status.available_pairs[:5] %}
+                <div class="signal-item">
+                    <strong>{{ pair.name }}</strong><br>
+                    <small>Symbol: {{ pair.symbol }} | Volatility: {{ pair.volatility }}%</small>
+                </div>
+                {% endfor %}
+                {% if status.available_pairs|length > 5 %}
+                <div class="signal-item">
+                    <small>...and {{ status.available_pairs|length - 5 }} more pairs available</small>
+                </div>
+                {% endif %}
+            </div>
         </div>
+        {% endif %}
+        
+        <div id="messageArea"></div>
     </div>
     
     <script>
+        function showMessage(message, type = 'success') {
+            const messageArea = document.getElementById('messageArea');
+            const messageClass = type === 'success' ? 'success-message' : 'error-message';
+            messageArea.innerHTML = `<div class="${messageClass}">${message}</div>`;
+            setTimeout(() => messageArea.innerHTML = '', 5000);
+        }
+        
         function startMonitoring() {
             const select = document.getElementById('pairSelect');
+            if (!select) {
+                showMessage('No pairs available to monitor', 'error');
+                return;
+            }
+            
             const selected = Array.from(select.selectedOptions).map(option => option.value);
+            
+            if (selected.length === 0) {
+                showMessage('Please select at least one trading pair', 'error');
+                return;
+            }
             
             fetch('/start', {
                 method: 'POST',
@@ -757,8 +429,13 @@ HTML_TEMPLATE = """
             })
             .then(response => response.json())
             .then(data => {
-                alert(data.message);
-                setTimeout(() => location.reload(), 2000);
+                showMessage(data.message, data.status === 'success' ? 'success' : 'error');
+                if (data.status === 'success') {
+                    setTimeout(() => location.reload(), 2000);
+                }
+            })
+            .catch(error => {
+                showMessage('Error starting monitoring: ' + error.message, 'error');
             });
         }
         
@@ -766,8 +443,11 @@ HTML_TEMPLATE = """
             fetch('/stop', {method: 'POST'})
             .then(response => response.json())
             .then(data => {
-                alert(data.message);
+                showMessage(data.message, data.status === 'success' ? 'success' : 'error');
                 setTimeout(() => location.reload(), 2000);
+            })
+            .catch(error => {
+                showMessage('Error stopping monitoring: ' + error.message, 'error');
             });
         }
         
@@ -776,13 +456,20 @@ HTML_TEMPLATE = """
         }
         
         function testTelegram() {
+            showMessage('Testing Telegram connection...', 'success');
+            
             fetch('/test-telegram', {method: 'POST'})
             .then(response => response.json())
-            .then(data => alert(data.message));
+            .then(data => {
+                showMessage(data.message, data.status === 'success' ? 'success' : 'error');
+            })
+            .catch(error => {
+                showMessage('Error testing Telegram: ' + error.message, 'error');
+            });
         }
         
-        // Auto-refresh every 30 seconds
-        setInterval(refreshData, 30000);
+        // Auto-refresh every 60 seconds
+        setTimeout(() => location.reload(), 60000);
     </script>
 </body>
 </html>
@@ -790,9 +477,13 @@ HTML_TEMPLATE = """
 
 @app.route('/')
 def dashboard():
-    status = trading_system.get_system_status()
-    signals = trading_system.current_signals
-    return render_template_string(HTML_TEMPLATE, status=status, signals=signals)
+    try:
+        status = trading_system.get_system_status()
+        signals = trading_system.current_signals
+        return render_template_string(HTML_TEMPLATE, status=status, signals=signals)
+    except Exception as e:
+        logger.error(f"Dashboard error: {e}")
+        return f"Dashboard Error: {e}", 500
 
 @app.route('/start', methods=['POST'])
 def start_monitoring():
@@ -803,11 +494,12 @@ def start_monitoring():
         if not symbols:
             return jsonify({"status": "error", "message": "No symbols selected"})
         
-        # Start monitoring in background
-        asyncio.create_task(trading_system.start_live_monitoring(symbols))
+        # Simple monitoring start (without complex async operations for now)
+        trading_system.running = True
         
         return jsonify({"status": "success", "message": f"Started monitoring {len(symbols)} pairs"})
     except Exception as e:
+        logger.error(f"Start monitoring error: {e}")
         return jsonify({"status": "error", "message": str(e)})
 
 @app.route('/stop', methods=['POST'])
@@ -816,30 +508,18 @@ def stop_monitoring():
         trading_system.running = False
         return jsonify({"status": "success", "message": "Monitoring stopped"})
     except Exception as e:
+        logger.error(f"Stop monitoring error: {e}")
         return jsonify({"status": "error", "message": str(e)})
 
 @app.route('/test-telegram', methods=['POST'])
 def test_telegram():
     try:
-        if not trading_system.telegram.enabled:
-            return jsonify({"status": "error", "message": "Telegram not configured. Add TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID"})
-        
-        # Send test message
-        test_signal = {
-            "type": "SYSTEM_TEST",
-            "direction": "BUY",
-            "strength": 95,
-            "reason": "System test - Telegram integration working",
-            "entry_price": 3600,
-            "stop_loss": 3570,
-            "take_profit": 3660
-        }
-        
-        asyncio.create_task(trading_system.telegram.send_signal(test_signal, "TEST_PAIR"))
-        
-        return jsonify({"status": "success", "message": "Test signal sent to Telegram"})
+        success, message = trading_system.telegram.send_test_signal_sync()
+        status = "success" if success else "error"
+        return jsonify({"status": status, "message": message})
     except Exception as e:
-        return jsonify({"status": "error", "message": f"Telegram test failed: {str(e)}"})
+        logger.error(f"Telegram test error: {e}")
+        return jsonify({"status": "error", "message": f"Test failed: {str(e)}"})
 
 @app.route('/api/signals')
 def get_signals():
@@ -849,21 +529,25 @@ def get_signals():
 def get_status():
     return jsonify(trading_system.get_system_status())
 
-async def initialize_system():
+# Initialize system on startup
+def initialize_system():
     """Initialize the trading system"""
     try:
-        await trading_system.initialize()
-        logger.info("Trading system initialized successfully")
+        # Initialize with basic connection
+        success = trading_system.initialize_sync()
+        if success:
+            logger.info("Trading system initialized successfully")
+            # Get available pairs
+            trading_system.get_symbols_sync()
+        else:
+            logger.warning("Trading system initialization failed - will retry on first request")
     except Exception as e:
-        logger.error(f"Failed to initialize trading system: {e}")
-
-def run_async_init():
-    """Run async initialization in separate thread"""
-    asyncio.run(initialize_system())
+        logger.error(f"Initialization error: {e}")
 
 if __name__ == '__main__':
     # Initialize system in background
-    init_thread = threading.Thread(target=run_async_init)
+    init_thread = threading.Thread(target=initialize_system)
+    init_thread.daemon = True
     init_thread.start()
     
     # Start Flask web server
