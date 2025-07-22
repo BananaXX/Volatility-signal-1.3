@@ -1,148 +1,76 @@
-# realtime_analytics.py
-
-import sqlite3
-import websocket
-import json
-import threading
 import time
-import datetime
-import requests
+import json
+import os
+import websocket
+from datetime import datetime
+from typing import List
 
-# === SETTINGS ===
-symbol = "Volatility 75"
-is_one_s = "(1s)" in symbol
-granularity = 60  # 1-minute candles
-history_days = 730  # ~2 years
-store_db = "trading_data.db"
+CANDLE_DIR = "candles"
 
-# === SYMBOL ID MAP ===
-def get_symbol_id(symbol_name):
-    if "(1s)" in symbol_name:
-        symbol_name = symbol_name.replace(" (1s)", ".1s")
-    return symbol_name.replace(" ", "_").lower()
+def store_historical_candles(symbol: str, candles: List[dict]):
+    filename = os.path.join(CANDLE_DIR, f"{symbol.replace(' ', '_')}_candles.json")
+    os.makedirs(CANDLE_DIR, exist_ok=True)
+    with open(filename, "w") as f:
+        json.dump(candles, f, indent=2)
+    print(f"[📦] Stored {len(candles)} candles for {symbol} in {filename}")
 
-# === DB SETUP ===
-def init_db():
-    conn = sqlite3.connect(store_db)
-    cursor = conn.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS candles (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            symbol TEXT,
-            timestamp INTEGER,
-            open REAL,
-            high REAL,
-            low REAL,
-            close REAL
-        )
-    """)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS ticks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            symbol TEXT,
-            timestamp INTEGER,
-            price REAL
-        )
-    """)
-    conn.commit()
-    conn.close()
+def fetch_historical_candles(symbol, years=2):
+    import websocket
+    import json
 
-# === STORE CANDLES ===
-def store_candles_to_db(symbol, candles):
-    conn = sqlite3.connect(store_db)
-    cursor = conn.cursor()
-    for candle in candles:
-        cursor.execute("""
-            INSERT OR REPLACE INTO candles (symbol, timestamp, open, high, low, close)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (
-            symbol,
-            candle["epoch"],
-            candle["open"],
-            candle["high"],
-            candle["low"],
-            candle["close"]
-        ))
-    conn.commit()
-    conn.close()
-
-# === FETCH HISTORICAL CANDLES ===
-def fetch_historical_candles(symbol, days=history_days, granularity=granularity):
-    print(f"[+] Fetching historical candles for {symbol} ({days} days)...")
-    candles = []
+    start_time = int(time.time()) - years * 365 * 24 * 60 * 60
     end_time = int(time.time())
-    start_time = end_time - (days * 86400)
-    symbol_id = get_symbol_id(symbol)
+    all_candles = []
+
+    def on_message(ws, message):
+        data = json.loads(message)
+        candles = data.get('candles', [])
+        if candles:
+            all_candles.extend(candles)
+        ws.close()
+
+    def on_error(ws, error):
+        print("❌ WebSocket error:", error)
+        ws.close()
 
     while start_time < end_time:
-        chunk_end = min(start_time + (1000 * granularity), end_time)
-        url = f"https://api.binary.com/v3/price_history?symbol={symbol_id}&granularity={granularity}&start={start_time}&end={chunk_end}"
-        try:
-            r = requests.get(url)
-            data = r.json()
-            if "candles" in data:
-                candles.extend(data["candles"])
-            else:
-                print("[!] No candles returned.")
-        except Exception as e:
-            print(f"[X] Error fetching candles: {e}")
-        start_time = chunk_end
-        time.sleep(1.5)
+        chunk_end = min(start_time + 5000 * 60, end_time)
+        ws = websocket.WebSocketApp(
+            "wss://ws.derivws.com/websockets/v3",
+            on_message=on_message,
+            on_error=on_error,
+        )
+        payload = {
+            "ticks_history": symbol,
+            "style": "candles",
+            "granularity": 60,
+            "start": start_time,
+            "end": chunk_end,
+            "subscribe": 0
+        }
 
-    store_candles_to_db(symbol, candles)
-    print(f"[✓] Stored {len(candles)} candles to DB.")
+        ws.on_open = lambda ws: ws.send(json.dumps(payload))
+        ws.run_forever()
+        if all_candles:
+            start_time = all_candles[-1]['epoch'] + 60
+        else:
+            break
 
-# === TICK HANDLER ===
-def process_tick(symbol, tick_data):
-    conn = sqlite3.connect(store_db)
-    cursor = conn.cursor()
-    cursor.execute("""
-        INSERT INTO ticks (symbol, timestamp, price)
-        VALUES (?, ?, ?)
-    """, (symbol, tick_data["epoch"], tick_data["quote"]))
-    conn.commit()
-    conn.close()
+    print(f"✅ Downloaded {len(all_candles)} historical candles.")
+    store_historical_candles(symbol, all_candles)
 
-# === WEBSOCKET CALLBACKS ===
-def on_message(ws, message):
-    msg = json.loads(message)
-    if "tick" in msg:
-        process_tick(symbol, msg["tick"])
+def load_historical_candles(symbol: str) -> List[dict]:
+    filename = os.path.join(CANDLE_DIR, f"{symbol.replace(' ', '_')}_candles.json")
+    if not os.path.exists(filename):
+        print(f"📡 No cached data found for {symbol}, fetching...")
+        fetch_historical_candles(symbol)
+    else:
+        print(f"[📁] Loading cached candles from {filename}")
+    with open(filename, "r") as f:
+        return json.load(f)
 
-def on_open(ws):
-    print("[✓] WebSocket connected.")
-    ws.send(json.dumps({
-        "ticks": get_symbol_id(symbol),
-        "subscribe": 1
-    }))
-
-def on_error(ws, error):
-    print("[X] WebSocket error:", error)
-
-def on_close(ws, close_status_code, close_msg):
-    print("[X] WebSocket closed.")
-
-# === START TICK STREAM ===
-def run():
-    websocket.enableTrace(False)
-    ws = websocket.WebSocketApp(
-        "wss://ws.binaryws.com/websockets/v3?app_id=1089",
-        on_open=on_open,
-        on_message=on_message,
-        on_error=on_error,
-        on_close=on_close
-    )
-    wst = threading.Thread(target=ws.run_forever)
-    wst.daemon = True
-    wst.start()
-
-# === MAIN ===
-def main():
-    init_db()
-    fetch_historical_candles(symbol)
-    run()
-    while True:
-        time.sleep(10)
-
+# Example usage (remove if called from elsewhere):
 if __name__ == "__main__":
-    main()
+    symbol = "R_75_1s"  # For Volatility 75 1s index
+    candles = load_historical_candles(symbol)
+    print(f"[🔢] Total candles loaded: {len(candles)}")
