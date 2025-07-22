@@ -1,132 +1,103 @@
-# main.py
-
-import os
-import time
+import asyncio
+import websockets
 import json
-import websocket
-import requests
-from datetime import datetime
+import os
+from datetime import datetime, timedelta
+from pathlib import Path
+import aiohttp
 
-TELEGRAM_BOT_TOKEN = 'YOUR_BOT_TOKEN'
-TELEGRAM_CHAT_ID = 'YOUR_CHAT_ID'
+# ===== CONFIGURATION =====
+symbol = "R_75_1s"  # Change to "R_75" for normal Volatility 75
+granularity = 60  # 1-minute candles
+telegram_token = "6442914504:AAH3dU5zHrs******"  # your bot token
+telegram_chat_id = "6442914504"
+whatsapp_group_name = "BAYNEX Signals"
+app_id = "1089"
 
-def send_telegram_message(message: str):
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
-        requests.post(url, json=payload)
-    except Exception as e:
-        print(f"Telegram error: {e}")
+# ===== SETUP LOGGING PATHS =====
+Path("./logs").mkdir(parents=True, exist_ok=True)
+log_file = f"./logs/{symbol}_candles.jsonl"
 
-def store_historical_candles(symbol, candles):
-    os.makedirs('historical', exist_ok=True)
-    path = f"historical/{symbol.replace(' ', '_')}_candles.json"
-    with open(path, "w") as f:
-        json.dump(candles, f, indent=2)
-    print(f"✅ Saved: {path}")
-    send_telegram_message(f"✅ Saved {len(candles)} candles for {symbol}")
+# ===== TELEGRAM ALERT FUNCTION =====
+async def send_telegram_message(message: str):
+    url = f"https://api.telegram.org/bot{telegram_token}/sendMessage"
+    data = {"chat_id": telegram_chat_id, "text": message}
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, data=data) as response:
+            await response.text()
 
-def fetch_historical_candles(symbol, years=2):
-    start_time = int(time.time()) - years * 365 * 24 * 60 * 60
-    end_time = int(time.time())
-    all_candles = []
+# ===== WHATSAPP PLACEHOLDER =====
+async def send_whatsapp_message(message: str):
+    print(f"[WhatsApp] {message} -> {whatsapp_group_name}")
 
-    def on_message(ws, message):
-        nonlocal all_candles
-        data = json.loads(message)
-        candles = data.get("candles", [])
-        if candles:
-            all_candles.extend(candles)
-        ws.close()
+# ===== WRITE CANDLE DATA TO DISK =====
+def save_candle(candle: dict):
+    with open(log_file, "a") as f:
+        f.write(json.dumps(candle) + "\n")
 
-    def on_error(ws, error):
-        print("WebSocket error:", error)
-        send_telegram_message("❌ WebSocket error fetching candles")
+# ======= HISTORICAL FETCHER =========
+async def fetch_historical_candles():
+    uri = "wss://ws.binaryws.com/websockets/v3?app_id=1089"
+    start_time = int((datetime.utcnow() - timedelta(days=730)).timestamp())  # 2 years back
+    end_time = int(datetime.utcnow().timestamp())
+    chunk_size = 5000
+    current = start_time
 
-    while start_time < end_time:
-        chunk_end = min(start_time + 5000 * 60, end_time)
-        ws = websocket.WebSocketApp(
-            "wss://ws.derivws.com/websockets/v3",
-            on_message=on_message,
-            on_error=on_error
-        )
+    async with websockets.connect(uri) as ws:
+        while current < end_time:
+            chunk_end = min(current + chunk_size * granularity, end_time)
+            request = {
+                "ticks_history": symbol,
+                "style": "candles",
+                "granularity": granularity,
+                "start": current,
+                "end": chunk_end,
+                "app_id": app_id
+            }
+            await ws.send(json.dumps(request))
+            response = await ws.recv()
+            data = json.loads(response)
 
+            if "candles" in data:
+                for candle in data["candles"]:
+                    save_candle(candle)
+
+            current = chunk_end
+            await asyncio.sleep(1)
+
+# ======= LIVE CANDLE UPDATER =========
+async def fetch_live_candle():
+    uri = "wss://ws.binaryws.com/websockets/v3?app_id=1089"
+
+    async with websockets.connect(uri) as ws:
         payload = {
             "ticks_history": symbol,
             "style": "candles",
-            "granularity": 60,
-            "start": start_time,
-            "end": chunk_end,
-            "subscribe": 0
+            "granularity": granularity,
+            "end": "latest",
+            "count": 1,
+            "subscribe": 1,
+            "app_id": app_id
         }
+        await ws.send(json.dumps(payload))
 
-        ws.on_open = lambda ws: ws.send(json.dumps(payload))
-        ws.run_forever()
-        if all_candles:
-            start_time = all_candles[-1]["epoch"] + 60
-        else:
-            break
-        time.sleep(1)
+        async for message in ws:
+            data = json.loads(message)
+            if "candles" in data:
+                candle = data["candles"][0]
+                save_candle(candle)
+                timestamp = datetime.utcfromtimestamp(candle["epoch"]).strftime('%Y-%m-%d %H:%M:%S')
+                price = candle["close"]
+                msg = f"[{symbol}] Live Close: {price} @ {timestamp}"
+                await send_telegram_message(msg)
+                await send_whatsapp_message(msg)
 
-    print(f"✅ Downloaded {len(all_candles)} candles")
-    store_historical_candles(symbol, all_candles)
-
-def fetch_live_candle(symbol):
-    live_candle = {}
-
-    def on_message(ws, message):
-        nonlocal live_candle
-        data = json.loads(message)
-        candle = data.get("ohlc")
-        if candle:
-            live_candle.update({
-                "open": float(candle["open"]),
-                "high": float(candle["high"]),
-                "low": float(candle["low"]),
-                "close": float(candle["close"]),
-                "epoch": int(candle["epoch"])
-            })
-        ws.close()
-
-    def on_error(ws, error):
-        print(f"Live feed error: {error}")
-        send_telegram_message("❌ Live candle fetch error")
-
-    ws = websocket.WebSocketApp(
-        "wss://ws.derivws.com/websockets/v3",
-        on_message=on_message,
-        on_error=on_error
-    )
-    payload = {
-        "ticks_history": symbol,
-        "style": "candles",
-        "granularity": 60,
-        "end": "latest",
-        "count": 1,
-        "subscribe": 1
-    }
-    ws.on_open = lambda ws: ws.send(json.dumps(payload))
-    ws.run_forever()
-
-    return live_candle
-
-def main():
-    symbols = ["R_75", "R_75_1S"]  # Volatility 75 and Volatility 75 1s
-    for symbol in symbols:
-        try:
-            print(f"\n📊 Fetching historical data for {symbol}...")
-            send_telegram_message(f"📊 Starting historical data fetch for {symbol}")
-            fetch_historical_candles(symbol)
-
-            print(f"\n🔍 Fetching live candle for {symbol}...")
-            live = fetch_live_candle(symbol)
-            print("Live candle:", live)
-            send_telegram_message(f"🔴 Live candle for {symbol}:\n{live}")
-
-        except Exception as e:
-            error_msg = f"❌ Error for {symbol}: {e}"
-            print(error_msg)
-            send_telegram_message(error_msg)
+# ===== MAIN RUNNER =====
+async def main():
+    print("📡 Starting Historical Download...")
+    await fetch_historical_candles()
+    print("✅ Historical Done. Now Listening Live...")
+    await fetch_live_candle()
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
